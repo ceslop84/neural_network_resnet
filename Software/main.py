@@ -1,44 +1,120 @@
+import os
 from math import sqrt
 from datetime import datetime
 import pandas as pd
 import numpy as np
-from tensorflow.keras import losses
-from tensorflow.keras.layers import Input, Dense, Conv2D, BatchNormalization, Activation, Flatten, Dropout, Add
-from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import losses, Sequential
+from tensorflow.keras.layers import Input, Dense, Conv2D, BatchNormalization, Activation, Flatten, Dropout, Add, MaxPooling2D, AveragePooling2D
+from tensorflow.keras.optimizers import Adam, RMSprop
 from tensorflow.keras.callbacks import ModelCheckpoint, LearningRateScheduler, ReduceLROnPlateau
 from tensorflow.keras.regularizers import l2
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers.experimental.preprocessing import Rescaling, RandomFlip, RandomRotation, RandomContrast
 from tensorflow.data.experimental import AUTOTUNE
 from tensorflow_datasets import load
-import matplotlib
-matplotlib.use('TkAgg') # sudo apt-get install python3-tk
-import matplotlib.pyplot as plt
 
 
-def visualize(dataset, labels, size):
-    figplot = int(sqrt(size))
-    figsize = figplot * 2
-    plt.figure(figsize=(figsize, figsize))
-    i = 0
-    for img in dataset.take(size):
-        plt.subplot(figplot, figplot,i+1)
-        plt.xticks([])
-        plt.yticks([])
-        plt.grid(False)
-        plt.imshow(img["image"], cmap=plt.cm.binary)
-        plt.xlabel(labels[img["label"]])
-        i += 1
-    plt.show()
+def resnet(input_shape, depth, num_classes, augmented, dropout, keep_prob):
+    
+    num_filters = 16
+    num_res_blocks = int((depth - 2)/6)
 
-def plot_graph(history):
-    plt.plot(history.history['accuracy'], label='accuracy')
-    plt.plot(history.history['val_accuracy'], label = 'val_accuracy')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.ylim([0, 1])
-    plt.legend(loc='lower right')
-    plt.show()
+    inputs = Input(shape=input_shape)
+    rescale = Sequential([Rescaling(1./255)])
+    x = rescale(inputs)
+
+    if augmented:
+        data_augmentation = Sequential([RandomFlip("horizontal_and_vertical"),
+                                        RandomRotation(0.2),
+                                        RandomContrast(0.2)])
+        x = data_augmentation(x)
+
+    x = net_layer(inputs=x)
+
+    # Instantiate the stack of residual units
+    for stack in range(3):
+        for res_block in range(num_res_blocks):
+            strides = 1
+            if stack > 0 and res_block == 0:  # first layer but not first stack
+                strides = 2  # downsample
+            y = net_layer(inputs=x,
+                          num_filters=num_filters,
+                          strides=strides)
+            y = net_layer(inputs=y,
+                          num_filters=num_filters,
+                          activation=None)
+            if stack > 0 and res_block == 0:  # first layer but not first stack
+                # linear projection residual shortcut connection to match
+                # changed dims
+                x = net_layer(inputs=x,
+                              num_filters=num_filters,
+                              kernel_size=1,
+                              strides=strides,
+                              activation=None,
+                              batch_normalization=False)
+            x = Add()([x, y])
+            x = Activation('relu')(x)
+        num_filters *= 2
+
+    # Add classifier on top.
+    # v1 does not use BN after last shortcut connection-ReLU
+    x = AveragePooling2D(pool_size=8)(x)
+    x = Flatten()(x)
+    if dropout:
+        x = Dropout(keep_prob)(x)
+    outputs = Dense(num_classes,
+                    activation='softmax',
+                    kernel_initializer='he_normal')(x)
+
+    # Instantiate model.
+    model = Model(inputs=inputs, outputs=outputs)
+    return model
+
+def flatnet(input_shape, depth, num_classes, augmented, dropout, keep_prob):
+    
+    num_filters = 16
+    num_res_blocks = int((depth - 2)/6)
+
+    inputs = Input(shape=input_shape)
+    rescale = Sequential([Rescaling(1./255)])
+    x = rescale(inputs)
+
+    if augmented:
+        data_augmentation = Sequential([RandomFlip("horizontal_and_vertical"),
+                                        RandomRotation(0.2),
+                                        RandomContrast(0.2)])
+        x = data_augmentation(x)
+
+    x = net_layer(inputs=x)
+
+    # Instantiate the stack of residual units
+    for stack in range(3):
+        for res_block in range(num_res_blocks):
+            strides = 1
+            if stack > 0 and res_block == 0:  # first layer but not first stack
+                strides = 2  # downsample
+            x = net_layer(inputs=x,
+                          num_filters=num_filters,
+                          strides=strides)
+            x = net_layer(inputs=x,
+                          num_filters=num_filters,
+                          activation=None)
+            x = Activation('relu')(x)
+        num_filters *= 2
+
+    # Add classifier on top.
+    # v1 does not use BN after last shortcut connection-ReLU
+    x = AveragePooling2D(pool_size=8)(x)
+    x = Flatten()(x)
+    if dropout:
+        x = Dropout(keep_prob)(x)
+    outputs = Dense(num_classes,
+                    activation='softmax',
+                    kernel_initializer='he_normal')(x)
+
+    # Instantiate model.
+    model = Model(inputs=inputs, outputs=outputs)
+    return model
 
 def save_data(model_name, dropout, augmented, learn_rate, history, test_loss, test_acc):
     #Geração do nome do arquivo.
@@ -67,6 +143,27 @@ def split_train_val_dataset(dataset, data_info):
             train_ds = train_ds.concatenate(label_ds.shard(num_shards=5, index=j))
     return train_ds, val_ds
 
+def lr_schedule(epoch):
+    """Learning Rate Schedule
+    Learning rate is scheduled to be reduced after 80, 120, 160, 180 epochs.
+    Called automatically every epoch as part of callbacks during training.
+    # Arguments
+        epoch (int): The number of epochs
+    # Returns
+        lr (float32): learning rate
+    """
+    lr = 1e-3
+    if epoch > 90:
+        lr *= 0.5e-3
+    elif epoch > 80:
+        lr *= 1e-3
+    elif epoch > 60:
+        lr *= 1e-2
+    elif epoch > 40:
+        lr *= 1e-1
+    print('Learning rate: ', lr)
+    return lr
+
 def configure_for_performance(ds,
                              batch_size,
                              shuffle_bs=1000,
@@ -91,188 +188,80 @@ def process_labels(data_info):
     get_label = data_info.features['label'].int2str
     return labels, num_labels, get_label
 
-def count_elements(dataset):
-    count = [i for i,_ in enumerate(dataset)][-1] + 1
-    return count
+def net_layer(inputs,
+                 num_filters=16,
+                 kernel_size=3,
+                 strides=1,
+                 activation='relu',
+                 batch_normalization=True,
+                 conv_first=True):
+    
+    conv = Conv2D(num_filters,
+                  kernel_size=kernel_size,
+                  strides=strides,
+                  padding='same',
+                  kernel_initializer='he_normal',
+                  kernel_regularizer=l2(1e-4))
 
-def lr_schedule(epoch):
-    """Learning Rate Schedule
-    Learning rate is scheduled to be reduced after 80, 120, 160, 180 epochs.
-    Called automatically every epoch as part of callbacks during training.
-    # Arguments
-        epoch (int): The number of epochs
-    # Returns
-        lr (float32): learning rate
-    """
-    lr = 1e-3
-    if epoch > 180:
-        lr *= 0.5e-3
-    elif epoch > 160:
-        lr *= 1e-3
-    elif epoch > 120:
-        lr *= 1e-2
-    elif epoch > 80:
-        lr *= 1e-1
-    print('Learning rate: ', lr)
-    return lr
-
-def identity_block(X, kernel_size, filters):
-
-    # Salvando valor de entrada...
-    X_shortcut = X
-
-    # Primeira camada.
-    X = Conv2D(filters = filters,
-               kernel_size = (1, 1),
-               strides = (1,1),
-               padding = 'same',
-               kernel_initializer='he_normal',
-               kernel_regularizer=l2(1e-4))(X)
-    X = BatchNormalization()(X)
-    X = Activation('relu')(X)
-
-    # Segunda camada.
-    X = Conv2D(filters = filters,
-               kernel_size = kernel_size,
-               strides = (1,1),
-               padding = 'same',
-               kernel_initializer='he_normal',
-               kernel_regularizer=l2(1e-4))(X)
-    X = BatchNormalization()(X)
-
-    # Final step: Add shortcut value to main path, and pass it through a RELU activation
-    X = Add()([X, X_shortcut])
-    X = Activation('relu')(X)
-
-    return X
-
-def convolutional_block(X, kernel_size, strides, filters, head=False):
-
-    # Salvando a entrada...
-    X_input = X
-
-    # Primeira camada.
-    X = Conv2D(filters=filters,
-               kernel_size=(1, 1),
-               strides=strides,
-               padding='same',
-               kernel_initializer='he_normal',
-               kernel_regularizer=l2(1e-4))(X)
-    X = BatchNormalization()(X)
-    X = Activation('relu')(X)
-
-    # Segunda camada.
-    X = Conv2D(filters=filters,
-               kernel_size=kernel_size,
-               strides=(1, 1),
-               padding='same',
-               kernel_initializer='he_normal',
-               kernel_regularizer=l2(1e-4))(X)
-    X = BatchNormalization()(X)
-
-    if not head:
-        # Concatenando com a entrada original...
-        X_input = Conv2D(filters=filters,
-                kernel_size=(1,1),
-                strides=strides,
-                padding='same',
-                kernel_initializer='he_normal',
-                kernel_regularizer=l2(1e-4))(X_input)
-
-    # Adicionando as camadas.
-    X = Add()([X, X_input])
-    X = Activation('relu')(X)
-
-    return X
+    x = inputs
+    if conv_first:
+        x = conv(x)
+        if batch_normalization:
+            x = BatchNormalization()(x)
+        if activation is not None:
+            x = Activation(activation)(x)
+    else:
+        if batch_normalization:
+            x = BatchNormalization()(x)
+        if activation is not None:
+            x = Activation(activation)(x)
+        x = conv(x)
+    return x
 
 def load_model(model_name, num_labels, keep_prob, input_shape, augmented, dropout):
     """Criando a arquitetura da rede, cfe nome."""
     # Criando o modelo sequencial.
 
-    inputs = Input(shape=input_shape)
-    x = Rescaling(1./255)(inputs)
-
-    if augmented:
-        x = RandomFlip("horizontal_and_vertical")(x)
-        x = RandomRotation(0.2)(x)
-        x = RandomContrast(0.2)(x)
-
-    x = Conv2D(filters=16,
-               kernel_size=(3, 3),
-               strides=(1, 1),
-               padding='same',
-               kernel_initializer='he_normal',
-               kernel_regularizer=l2(1e-4))(x)
-    x = BatchNormalization()(x)
-    x = Activation('relu')(x)
-
     if model_name == "Flat8":
-        x = convolutional_block(x, filters=16, kernel_size=(3,3), strides=(1,1), head=True)
-        x = convolutional_block(x, filters=32, kernel_size=(3,3), strides=(2,2))
-        x = convolutional_block(x, filters=64, kernel_size=(3,3), strides=(2,2))
+        model = flatnet(input_shape=input_shape, depth=8, num_classes=num_labels, augmented=augmented, dropout=dropout, keep_prob=keep_prob)
 
     elif model_name == "Flat14":
-        x = convolutional_block(x, filters=16, kernel_size=(3,3), strides=(1,1), head=True)
-        x = convolutional_block(x, filters=16, kernel_size=(3,3), strides=(1,1))
-        x = convolutional_block(x, filters=16, kernel_size=(3,3), strides=(1,1))
-        x = convolutional_block(x, filters=32, kernel_size=(3,3), strides=(2,2))
-        x = convolutional_block(x, filters=32, kernel_size=(3,3), strides=(1,1))
-        x = convolutional_block(x, filters=32, kernel_size=(3,3), strides=(1,1))
+        model = flatnet(input_shape=input_shape, depth=14, num_classes=num_labels, augmented=augmented, dropout=dropout, keep_prob=keep_prob)
 
     elif model_name == "Flat20":
-        x = convolutional_block(x, filters=16, kernel_size=(3,3), strides=(1,1), head=True)
-        x = convolutional_block(x, filters=16, kernel_size=(3,3), strides=(1,1))
-        x = convolutional_block(x, filters=16, kernel_size=(3,3), strides=(1,1))
-        x = convolutional_block(x, filters=32, kernel_size=(3,3), strides=(2,2))
-        x = convolutional_block(x, filters=32, kernel_size=(3,3), strides=(1,1))
-        x = convolutional_block(x, filters=32, kernel_size=(3,3), strides=(1,1))
-        x = convolutional_block(x, filters=64, kernel_size=(3,3), strides=(2,2))
-        x = convolutional_block(x, filters=64, kernel_size=(3,3), strides=(1,1))
-        x = convolutional_block(x, filters=64, kernel_size=(3,3), strides=(1,1))
+        model = flatnet(input_shape=input_shape, depth=20, num_classes=num_labels, augmented=augmented, dropout=dropout, keep_prob=keep_prob)
+
+    elif model_name == "Flat26":
+        model = flatnet(input_shape=input_shape, depth=26, num_classes=num_labels, augmented=augmented, dropout=dropout, keep_prob=keep_prob)
+
+    elif model_name == "Flat32":
+        model = flatnet(input_shape=input_shape, depth=32, num_classes=num_labels, augmented=augmented, dropout=dropout, keep_prob=keep_prob)
 
     elif model_name == "ResNet8":
-        x = convolutional_block(x, filters=16, kernel_size=(3,3), strides=(1,1), head=True)
-        x = identity_block(x, filters=16, kernel_size=(3,3))
-        x = identity_block(x, filters=16, kernel_size=(3,3))
+        model = resnet(input_shape=input_shape, depth=8, num_classes=num_labels, augmented=augmented, dropout=dropout, keep_prob=keep_prob)
 
     elif model_name == "ResNet14":
-        x = convolutional_block(x, filters=16, kernel_size=(3,3), strides=(1,1), head=True)
-        x = identity_block(x, filters=16, kernel_size=(3,3))
-        x = identity_block(x, filters=16, kernel_size=(3,3))
-        x = convolutional_block(x, filters=32, kernel_size=(3,3), strides=(2,2))
-        x = identity_block(x, filters=32, kernel_size=(3,3))
-        x = identity_block(x, filters=32, kernel_size=(3,3))
+        model = resnet(input_shape=input_shape, depth=14, num_classes=num_labels, augmented=augmented, dropout=dropout, keep_prob=keep_prob)
 
     elif model_name == "ResNet20":
-        x = convolutional_block(x, filters=16, kernel_size=(3,3), strides=(1,1), head=True)
-        x = identity_block(x, filters=16, kernel_size=(3,3))
-        x = identity_block(x, filters=16, kernel_size=(3,3))
-        x = convolutional_block(x, filters=32, kernel_size=(3,3), strides=(2,2))
-        x = identity_block(x, filters=32, kernel_size=(3,3))
-        x = identity_block(x, filters=32, kernel_size=(3,3))
-        x = convolutional_block(x, filters=64, kernel_size=(3,3), strides=(2,2))
-        x = identity_block(x, filters=64, kernel_size=(3,3))
-        x = identity_block(x, filters=64, kernel_size=(3,3))
+        model = resnet(input_shape=input_shape, depth=20, num_classes=num_labels, augmented=augmented, dropout=dropout, keep_prob=keep_prob)
+
+    elif model_name == "ResNet26":
+        model = resnet(input_shape=input_shape, depth=26, num_classes=num_labels, augmented=augmented, dropout=dropout, keep_prob=keep_prob)
+
+    elif model_name == "ResNet32":
+        model = resnet(input_shape=input_shape, depth=32, num_classes=num_labels, augmented=augmented, dropout=dropout, keep_prob=keep_prob)
+
 
     else:
         # Se chegou até aqui, não retornou nenhum modelo pois não reconheceu o nome.
         raise Exception("Nome do modelo desconhecido/não suportado.")
 
-    x = Flatten()(x)
-
-    if dropout:
-        x = Dropout(keep_prob)(x)
-    outputs = Dense(num_labels,
-                    activation='softmax',
-                    kernel_initializer='he_normal')(x)
-
-    # Create model
-    model = Model(inputs=inputs, outputs=outputs)
     model.summary()
     return model
 
 def run(epochs, batch_size, optimizer, loss, metrics,
-        folder, input_shape, keep_prob, train_size, val_size, test_size,
+        input_shape, keep_prob, train_size, val_size, test_size,
         model_name, dropout, augmented, learn_rate):
 
     # Ler os dados do modelo.
@@ -297,19 +286,15 @@ def run(epochs, batch_size, optimizer, loss, metrics,
                 loss=loss,
                 metrics=metrics)
 
-    # Prepare callbacks for model saving and for learning rate adjustment.
+   # Prepare callbacks for model saving and for learning rate adjustment.
     callbacks = list()
-    checkpoint = ModelCheckpoint(filepath=folder,
-                                monitor='val_acc',
-                                save_best_only=True)
-    callbacks.append(checkpoint)
     if learn_rate:
         lr_scheduler = LearningRateScheduler(lr_schedule)
         callbacks.append(lr_scheduler)
     lr_reducer = ReduceLROnPlateau(factor=np.sqrt(0.1),
-                                cooldown=0,
-                                patience=5,
-                                min_lr=0.5e-6)
+                                   cooldown=0,
+                                   patience=5,
+                                   min_lr=0.5e-6)
     callbacks.append(lr_reducer)
 
     # Treinar modelo com dados de treinamento e validação.
@@ -325,21 +310,19 @@ def run(epochs, batch_size, optimizer, loss, metrics,
 
     return history, test_loss, test_acc
 
-
 # Parâmetros de entrada.
-EPOCHS = 50
+EPOCHS = 100
 BATCH_SIZE = 32
-FOLDER = "localdata/"
 INPUT_SHAPE = (32,32,3)
 KEEP_PROB = 0.7
 TRAIN_SIZE = 40000
 VAL_SIZE = 10000
 TEST_SIZE = 10000
 OPTIMIZER = Adam(learning_rate=lr_schedule(0))
-LOSS = losses.SparseCategoricalCrossentropy(from_logits=True)
+LOSS = losses.SparseCategoricalCrossentropy()
 METRICS = ['accuracy']
 
-MODEL_NAME = ["Flat8", "Flat14", "Flat20", "ResNet8", "ResNet14", "ResNet20"]
+MODEL_NAME = ["ResNet32", "Flat32", "ResNet8", "Flat8", "ResNet20", "Flat20"]
 DROPOUT = [True, False]
 AUGMENTED = [True, False]
 LEARN_RATE = [True, False]
@@ -349,7 +332,7 @@ for m in MODEL_NAME:
         for a in AUGMENTED:
             for l in LEARN_RATE:
                 history, test_loss, test_acc = run(EPOCHS, BATCH_SIZE, OPTIMIZER, LOSS, METRICS,
-                                                   FOLDER, INPUT_SHAPE, KEEP_PROB,
+                                                   INPUT_SHAPE, KEEP_PROB,
                                                    TRAIN_SIZE, VAL_SIZE, TEST_SIZE,
                                                    m, d, a, l)
                 save_data(m, d, a, l, history, test_loss, test_acc)
